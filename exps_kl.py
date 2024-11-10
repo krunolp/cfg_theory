@@ -32,90 +32,86 @@ def get_job_id():
     return None
 
 
-
-def calc_logsumexp(x, denom):
-    return torch.exp(x - torch.logsumexp(denom, dim=0))
-
-def uncond_score(x, t, m1, m2, Gamma_t, label=None, omega=None):
-    exp_neg_t = torch.exp(-t)
-    exp_neg_m1m2 = torch.exp(-m1 * m2 * exp_neg_t**2 / Gamma_t)
-    exp_pos_m1m2 = torch.exp(m1 * m2 * exp_neg_t**2 / Gamma_t)
-    x_dot_m1_plus_m2 = torch.dot(x, (m1 + m2))
-    x_dot_m1_minus_m2 = torch.dot(x, (m1 - m2))
-
-    arg1 = torch.log(exp_neg_m1m2) + x_dot_m1_plus_m2 * exp_neg_t / Gamma_t
-    arg2 = torch.log(exp_neg_m1m2) - x_dot_m1_plus_m2 * exp_neg_t / Gamma_t
-    arg3 = torch.log(exp_pos_m1m2) + x_dot_m1_minus_m2 * exp_neg_t / Gamma_t
-    arg4 = torch.log(exp_pos_m1m2) - x_dot_m1_minus_m2 * exp_neg_t / Gamma_t
-
-    denom = torch.stack([arg1, arg2, arg3, arg4], dim=0)
-    l11 = (m1 + m2) * calc_logsumexp(arg1, denom)
-    l12 = -(m1 + m2) * calc_logsumexp(arg2, denom)
-    l21 = (m1 - m2) * calc_logsumexp(arg3, denom)
-    l22 = - (m1 - m2) * calc_logsumexp(arg4, denom)
-
-    S_i_t = (-x / Gamma_t) + (exp_neg_t / Gamma_t) * (l11 + l12 + l21 + l22)
-    return S_i_t
-
-def cond_score(x, t, m1, m2, Gamma_t, label=0, omega=None):
-    score = (-x +((2*(label<2)-1) * m1 + (2*(label%2)-1) * m2) * torch.exp(-t)) / Gamma_t
-    return score
-
-def cfg(x, t, m1, m2, Gamma_t, omega, label=0):
-    uncond_score_ = uncond_score(x, t, m1, m2, Gamma_t, label)
-    cond_score_ = cond_score(x, t, m1, m2, Gamma_t, label)
-    return (1+omega) * cond_score_ - omega * uncond_score_
+def ff(x,omega, alpha):
+    if alpha==0:
+        return omega
+    else:
+        return omega/(x**(-alpha)+1.e-6)
 
 
-def get_vf(m1, m2, score_func, t, dt, sigma, n=10, min=-5, max=5, label=0, plot=False, omega=None):
-    t, sigma = torch.tensor(t), torch.tensor(sigma)
-    Gamma_t = sigma**2*torch.exp(-2*t) + dt
+def calc_score(itau, dt, itfms, omega, q, sigma2, alpha):
+    expt = np.exp(-dt*(itfms-itau))
+    exp2t = expt**2
+    gammat = (sigma2*exp2t+1-exp2t)
+    tanh = np.tanh(q*expt/gammat)
+    nonlinear = (expt/gammat)*(1+(1 - np.tanh(q*expt/gammat)) *
+                               ff((expt/gammat)*(1-tanh), omega, alpha))  # K: fixed, divided by gammat
+    # Norm of S_full-S_class # this is what is added in cfg
+    normdiff = (expt/gammat)*(1-tanh)
+    return nonlinear, normdiff
 
-    xx, yy = torch.meshgrid(
-    [torch.linspace(min, max, steps=n)]*2, indexing='ij')
-    inp = torch.stack((xx, yy), dim=-1).reshape(-1, 2)
-
-    conc = []
-    for inp_ in inp:
-        conc.append(score_func(inp_, t, m1, m2, Gamma_t, label=label, omega=omega))
-
-    conc = torch.stack(conc).reshape(n, n, 2).detach().numpy()
-    inp = inp.reshape(n, n, 2).detach().numpy()
+def init_backward():
+    return np.random.normal(0,1)
     
-    if plot:
-        plt.figure(figsize=(8, 8))
-        plt.quiver(inp[:,:,0],inp[:,:,1],conc[:,:,0],conc[:,:,1])
-        for plots in [m1+m2, m1-m2, -m1+m2, -m1-m2]:
-            plt.scatter(plots[0], plots[1], color='r', s=100)
-        plt.show()
-    return inp, conc
+def calc_traj_back_exact(qinit,nt,dt,itfms,omega,sigma2, alpha):
+    qback = np.zeros(nt)
+    time = np.zeros(nt)
+    normd = np.zeros(nt)
+    qback[0] = qinit
+    q = qback[0]
+    time[0] = 0
+    for it in np.arange(nt-1):
+        expt = np.exp(-dt*(itfms-it))
+        exp2t = expt**2
+        gammat = (sigma2*exp2t+1-exp2t)
+        eta = np.random.normal(0, np.sqrt(2*dt))
+        sc, normdiff = calc_score(it, dt, itfms, omega, q, sigma2, alpha)
+        q = q-dt*q*(2/gammat-1)+2*dt*sc+eta
+        qback[it+1] = q
+        time[it+1] = it*dt
+        normd[it] = normdiff
+    return time, qback, normd
+
 
 def kl_div(sample1, sample2):
-    mean1, std1 = sample1.mean(dim=0), sample1.std(dim=0)
-    mean2, std2 = sample2.mean(dim=0), sample2.std(dim=0)
+    mean1, std1 = np.mean(sample1, axis=0), np.std(sample1, axis=0)
+    mean2, std2 = np.mean(sample2, axis=0), np.std(sample2, axis=0)
 
-    var1, var2 = torch.pow(std1, 2), torch.pow(std2, 2)
-    kl = 0.5 * torch.sum(torch.pow(mean1 - mean2, 2) / var2 +
-                         var1 / var2 - 1.0 - torch.log10(var1) + torch.log10(var2))
-    return kl.sum()
+    var1, var2 = np.power(std1, 2), np.power(std2, 2)
+    kl = 0.5 * np.sum(np.power(mean1 - mean2, 2) / var2 +
+                         var1 / var2 - 1.0 - np.log10(var1) + np.log10(var2))
+    return np.sum(kl)
 
-def classic_experiment(sigma, seed=12345):
-    m1 = torch.tensor([5.,0.])
-    m2 = torch.tensor([0., 5])
-    dt = 0.05
-    finish_time = 4.
 
-    num_samples = 200
-    mean, cov = torch.tensor([0., 0.]), torch.tensor([[1., 0.], [0., 1.]])
-    distribution = torch.distributions.MultivariateNormal(mean, cov)
-    all_samples = distribution.sample((num_samples,))
+def classic_experiment(dim, seed=12345):
+    nsample=100
+    dt=.01
+    nt=800 #final time is nt*dt
+    sigma2=1.
+    alpha = -0.5
+
+    tspec=(1/2)*np.log(dim)
+    ns=int(tspec/dt)
+    print("Speciation time is: ", ns)
+    #ns=200 #speciation time is t_s=ns*dt=(1/2) log (d)
+    itfms=nt-ns
+    nomega=5
+    omegag=np.zeros(nomega)
+    qtraj=np.zeros((nomega,nsample,nt))
+    normstat=np.zeros((nomega,nsample,nt))
+    for ijk in np.arange(nsample):
+        qinit=init_backward()
+        for iomega in np.arange(nomega):
+            omega=4*iomega
+            omegag[iomega]=omega
+            time, qtraj[iomega,ijk,:],normstat[iomega,ijk,:]=calc_traj_back_exact(qinit,nt,dt,itfms,omega,sigma2, alpha)
 
     job_id = get_job_id()
 
     run = wandb.init(
-        project="diff_theory2_fast",
+        project="new_diff",
         config={
-        "sigma": sigma,
+        "dim": dim,
         "job_id": job_id,
         "dt": dt,
         }
